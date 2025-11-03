@@ -1,80 +1,189 @@
 import random
 from datetime import datetime, timedelta
-import pandas as pd
-import numpy as np
 from pathlib import Path
 
+import pandas as pd
+
 random.seed(7)
-np.random.seed(7)
 
-start_date = datetime(2025, 8, 21, 8, 0, 0)
-num_orders = 100
-wheel_types = ["Urban-200", "Offroad-250", "Racing-180", "HeavyDuty-300", "Eco-160"]
-machines = [
-    ("M1", "Lathe"), ("M2", "CNC"), ("M3", "Drill"),
-    ("M4", "Paint"), ("M5", "Assembly"), ("M6", "QA"),
-]
+# FMCG vrac products (stored in wheel_type column for compatibility)
+PRODUCTS = ["VRAC_SHAMPOO_BASE", "VRAC_CONDITIONER_BASE", "VRAC_HAIR_MASK"]
+QUANTITIES = [4000, 6000, 8000, 10000, 12000]
+TIMES = ["08:00:00", "12:00:00", "16:00:00"]
 
-operation_templates = [[
-    {"op": "Turning",  "allowed_machines": ["M1"], "base_min": 1.0, "base_max": 2.5},
-    {"op": "CNC",      "allowed_machines": ["M2"], "base_min": 1.0, "base_max": 3.0},
-    {"op": "Drill",    "allowed_machines": ["M3"], "base_min": 0.5, "base_max": 1.5},
-    {"op": "Paint",    "allowed_machines": ["M4"], "base_min": 1.0, "base_max": 2.0},
-    {"op": "Assembly", "allowed_machines": ["M5"], "base_min": 1.0, "base_max": 2.0},
-    {"op": "QA",       "allowed_machines": ["M6"], "base_min": 0.5, "base_max": 1.0, "optional": True},
-]]
+# Rates per product and operation (kg/h)
+RATES = {
+    "VRAC_SHAMPOO_BASE": {
+        "mix": 6000,
+        "trans": 15000,
+        "fill": 5000,
+        "fin": 20000,
+    },
+    "VRAC_CONDITIONER_BASE": {
+        "mix": 5000,
+        "trans": 15000,
+        "fill": 4500,
+        "fin": 18000,
+    },
+    "VRAC_HAIR_MASK": {
+        "mix": 4000,
+        "trans": 12000,
+        "fill": 3500,
+        "fin": 16000,
+    },
+}
 
-type_speed = {"Urban-200":1.0,"Offroad-250":1.2,"Racing-180":0.9,"HeavyDuty-300":1.35,"Eco-160":0.85}
 
-orders = []
-for i in range(1, num_orders + 1):
-    wtype = random.choice(wheel_types)
-    qty = random.randint(20, 120)
-    horizon_days = random.randint(3, 14)
-    due = start_date + timedelta(days=horizon_days, hours=random.randint(0, 8))
-    template = operation_templates[0][:]
-    ops = []
-    for step in template:
-        if step.get("optional", False):
-            if random.random() < 0.85:
-                ops.append({k:v for k,v in step.items() if k!="optional"})
-        else:
-            ops.append(step)
-    if random.random() < 0.35:
-        heat_op = {"op": "HeatTreat", "allowed_machines": ["M2","M3"], "base_min": 0.75, "base_max": 1.75}
-        ops.insert(2, heat_op)
-    orders.append({"order_id": f"O{i:03d}", "wheel_type": wtype, "quantity": qty, "due_date": due, "ops": ops})
+def build_orders(num_orders: int = 50) -> pd.DataFrame:
+    """
+    Create 50 orders starting from 2025-11-03.
 
-orders_df = pd.DataFrame([{
-    "order_id": o["order_id"], "wheel_type": o["wheel_type"], "quantity": o["quantity"], "due_date": o["due_date"]
-} for o in orders])
+    - order_id: O001..O050
+    - wheel_type: VRAC_SHAMPOO_BASE / VRAC_CONDITIONER_BASE / VRAC_HAIR_MASK
+    - quantity: cycles over [4000, 6000, 8000, 10000, 12000]
+    - due_date: from 2025-11-03 to 2025-11-12, times 08:00 / 12:00 / 16:00
+    """
+    base_date = datetime(2025, 11, 3).date()
+    rows = []
 
-machine_next_free = {m[0]: start_date for m in machines}
-schedule_rows = []
-orders_sorted = sorted(orders, key=lambda x: (x["due_date"], x["wheel_type"]))
+    for i in range(1, num_orders + 1):
+        idx = i - 1
+        order_id = f"O{i:03d}"
 
-for o in orders_sorted:
-    prev_end = start_date
-    for seq, step in enumerate(o["ops"], start=1):
-        base = np.random.uniform(step["base_min"], step["base_max"])
-        setup = np.random.uniform(0.2, 0.6)
-        rate = base * type_speed[o["wheel_type"]]
-        duration_hours = setup + rate * (0.5 + 0.5*np.log1p(o["quantity"]/20.0))
-        earliest_machine = min(step["allowed_machines"], key=lambda m: machine_next_free[m])
-        est = max(prev_end, machine_next_free[earliest_machine])
-        start_t = est
-        end_t = est + timedelta(hours=float(duration_hours))
-        machine_next_free[earliest_machine] = end_t
-        prev_end = end_t
-        schedule_rows.append({
-            "order_id": o["order_id"], "wheel_type": o["wheel_type"], "operation": step["op"],
-            "machine": earliest_machine, "start": start_t, "end": end_t,
-            "duration_hours": duration_hours, "sequence": seq, "due_date": o["due_date"]
-        })
+        sku = PRODUCTS[idx % len(PRODUCTS)]
+        qty = QUANTITIES[idx % len(QUANTITIES)]
 
-schedule_df = pd.DataFrame(schedule_rows)
+        # every 5 orders, push due date by 1 day
+        day_offset = idx // 5
+        date = base_date + timedelta(days=day_offset)
 
-Path("data").mkdir(exist_ok=True, parents=True)
-orders_df.to_csv("data/scooter_orders.csv", index=False)
-schedule_df.to_csv("data/scooter_schedule.csv", index=False)
-print("Wrote data/scooter_orders.csv and data/scooter_schedule.csv")
+        time_str = TIMES[idx % len(TIMES)]
+        due_date = datetime.fromisoformat(f"{date.isoformat()} {time_str}")
+
+        rows.append(
+            {
+                "order_id": order_id,
+                # keep column name 'wheel_type' to avoid breaking the app
+                "wheel_type": sku,
+                "quantity": qty,
+                "due_date": due_date,
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def build_schedule(orders_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build a 4-operation chain per order:
+      1. MIXING/PROCESSING  on 'Mixing/Processing'
+      2. TRANSFER/HOLDING   on 'Transfer/Holding'
+      3. FILLING/CAPPING    on 'Filling/Capping'
+      4. FINISHING/QC       on 'Finishing/QC'
+
+    Hard constraint INSIDE each order:
+    op(n+1).start == op(n).end  (strict end-start, no waiting within the chain)
+
+    For simplicity, we schedule orders one full chain after another,
+    so resources never overlap between orders.
+    """
+    rows = []
+
+    # Chain starting point (before first due dates)
+    current_start = datetime(2025, 11, 3, 6, 0, 0)
+
+    for _, o in orders_df.sort_values("order_id").iterrows():
+        order_id = o["order_id"]
+        sku = o["wheel_type"]
+        qty = float(o["quantity"])
+        due = o["due_date"]
+
+        rates = RATES[sku]
+
+        def dur(rate_kg_per_hour: float) -> timedelta:
+            # duration in hours = quantity / rate
+            return timedelta(hours=qty / float(rate_kg_per_hour))
+
+        # Op 1: Mixing/Processing
+        mix_start = current_start
+        mix_end = mix_start + dur(rates["mix"])
+
+        # Op 2: Transfer/Holding
+        trans_start = mix_end
+        trans_end = trans_start + dur(rates["trans"])
+
+        # Op 3: Filling/Capping
+        fill_start = trans_end
+        fill_end = fill_start + dur(rates["fill"])
+
+        # Op 4: Finishing/QC
+        fin_start = fill_end
+        fin_end = fin_start + dur(rates["fin"])
+
+        rows.append(
+            {
+                "order_id": order_id,
+                "wheel_type": sku,
+                "operation": "MIXING/PROCESSING",
+                "sequence": 1,
+                "machine": "Mixing/Processing",
+                "start": mix_start,
+                "end": mix_end,
+                "due_date": due,
+            }
+        )
+        rows.append(
+            {
+                "order_id": order_id,
+                "wheel_type": sku,
+                "operation": "TRANSFER/HOLDING",
+                "sequence": 2,
+                "machine": "Transfer/Holding",
+                "start": trans_start,
+                "end": trans_end,
+                "due_date": due,
+            }
+        )
+        rows.append(
+            {
+                "order_id": order_id,
+                "wheel_type": sku,
+                "operation": "FILLING/CAPPING",
+                "sequence": 3,
+                "machine": "Filling/Capping",
+                "start": fill_start,
+                "end": fill_end,
+                "due_date": due,
+            }
+        )
+        rows.append(
+            {
+                "order_id": order_id,
+                "wheel_type": sku,
+                "operation": "FINISHING/QC",
+                "sequence": 4,
+                "machine": "Finishing/QC",
+                "start": fin_start,
+                "end": fin_end,
+                "due_date": due,
+            }
+        )
+
+        # Next order starts only after this whole chain finishes
+        current_start = fin_end
+
+    return pd.DataFrame(rows)
+
+
+def main():
+    orders_df = build_orders(num_orders=50)
+    schedule_df = build_schedule(orders_df)
+
+    Path("data").mkdir(exist_ok=True, parents=True)
+    orders_df.to_csv("data/scooter_orders.csv", index=False)
+    schedule_df.to_csv("data/scooter_schedule.csv", index=False)
+    print("Wrote FMCG vrac data to data/scooter_orders.csv and data/scooter_schedule.csv")
+
+
+if __name__ == "__main__":
+    main()
