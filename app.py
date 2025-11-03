@@ -12,17 +12,6 @@ import altair as alt
 
 # ============================ Additional Data generation ============================
 
-# ⬇️ Add this import to use the generator script you edited
-from Scripts.generate_sample_data import main as generate_sample_data
-
-# Ensure data files exist (generate them once automatically)
-DATA_DIR = Path("data")
-orders_csv = DATA_DIR / "scooter_orders.csv"
-sched_csv = DATA_DIR / "scooter_schedule.csv"
-
-if not orders_csv.exists() or not sched_csv.exists():
-    # This will create the FMCG vrac dataset (50 orders, 4 ops/order)
-    generate_sample_data()
 # ============================ PAGE & SECRETS ============================
 
 st.set_page_config(page_title="FMCG Vrac Scheduler", layout="wide")
