@@ -1,186 +1,657 @@
-
 import os
-import pandas as pd
+import json
+import re
+from datetime import timedelta
+
+import pytz
+from dateutil import parser as dtp
 import streamlit as st
-from datetime import datetime, timedelta, date
-from pathlib import Path
-import plotly.graph_objects as go
+import pandas as pd
+import altair as alt
 
-from utils.scheduling import schedule_orders
-from utils.nlp import parse_command
+# ============================ PAGE & SECRETS ============================
 
-st.set_page_config(page_title="FMCG Vrac Scheduler (4 Ops, No-Wait)", layout="wide")
+st.set_page_config(page_title="FMCG Vrac Scheduler", layout="wide")
 
-DATA_DIR = Path(__file__).parent / "data"
-
-@st.cache_data
-def load_products():
-    return pd.read_csv(DATA_DIR / "vrac_products.csv")
-
-@st.cache_data
-def load_lines():
-    return pd.read_csv(DATA_DIR / "lines.csv")
-
-@st.cache_data
-def load_orders():
-    df = pd.read_csv(DATA_DIR / "orders.csv")
-    df["due_date"] = pd.to_datetime(df["due_date"]).dt.tz_localize(None)
-    return df
-
-def save_orders(df: pd.DataFrame):
-    df.to_csv(DATA_DIR / "orders.csv", index=False)
-    load_orders.clear()
-
-def to_records(df):
-    return df.to_dict(orient="records")
-
-def build_schedule(products_df, orders_df):
-    prods = to_records(products_df)
-    ords = to_records(orders_df)
-    for o in ords:
-        o["due_date"] = pd.to_datetime(o["due_date"]).to_pydatetime()
-    start_time = datetime.now().replace(minute=0, second=0, microsecond=0)
-    ops = schedule_orders(ords, prods, start_time=start_time)
-    rows = []
-    for op in ops:
-        rows.append({
-            "order_id": op.order_id,
-            "sku_id": op.sku_id,
-            "operation": op.op,
-            "line_id": op.line_id,
-            "start": op.start,
-            "end": op.end,
-            "duration_h": (op.end - op.start).total_seconds()/3600.0
-        })
-    return pd.DataFrame(rows)
-
-def gantt(df: pd.DataFrame):
-    if df.empty:
-        st.info("No schedule to show."); return
-    df = df.sort_values("start")
-    fig = go.Figure()
-    color_map = {"MIX_1":"#1f77b4","TRANS_1":"#9467bd","FILL_1":"#ff7f0e","FIN_1":"#2ca02c"}
-    for _, row in df.iterrows():
-        fig.add_trace(go.Bar(
-            x=[row["end"] - row["start"]],
-            y=[row["line_id"]],
-            base=[row["start"]],
-            orientation='h',
-            name=f'{row["order_id"]}-{row["operation"]}',
-            hovertemplate=(
-                f"Order: {row['order_id']}<br>"
-                f"SKU: {row['sku_id']}<br>"
-                f"Op: {row['operation']} on {row['line_id']}<br>"
-                f"Start: {row['start']}<br>"
-                f"End: {row['end']}<br>"
-                f"Duration: {row['duration_h']:.2f} h"
-            ),
-            marker_color=color_map.get(row["line_id"])
-        ))
-    fig.update_layout(
-        barmode='stack',
-        title="Gantt – 4-Op No-Wait Chain (Mix → Transfer → Fill → Finish)",
-        xaxis_title="Time",
-        yaxis_title="Line",
-        showlegend=False,
-        bargap=0.15,
-        height=560
+# Pull OPENAI key from Streamlit secrets if available
+try:
+    os.environ["OPENAI_API_KEY"] = (
+        os.environ.get("OPENAI_API_KEY") or st.secrets["OPENAI_API_KEY"]
     )
-    fig.update_yaxes(categoryorder='array', categoryarray=["MIX_1","TRANS_1","FILL_1","FIN_1"])
-    st.plotly_chart(fig, use_container_width=True)
+except Exception:
+    # fine; we'll fall back to regex if no key
+    pass
 
-# ---------------- UI ----------------
-st.title("FMCG Vrac Scheduler (4 Ops, No-Wait)")
+# ============================ DATA LOADING =============================
 
-with st.container():
-    st.subheader("Command Prompt")
-    cmd = st.text_input("Type a command (e.g., 'add order VRAC_SHAMPOO_BASE 8000kg due 2025-11-06')")
-    if st.button("Apply Command", type="primary"):
-        parsed = parse_command(cmd or "")
-        st.write("Parsed:", parsed)
-        orders_df = load_orders()
 
-        if parsed.get("intent") == "add_order":
-            new_id = f"ORD-{len(orders_df)+1:03d}"
-            new_row = {
-                "order_id": new_id,
-                "sku_id": parsed["sku_id"],
-                "qty_kg": int(parsed["qty_kg"]),
-                "due_date": parsed["due_date"],
-            }
-            orders_df = pd.concat([orders_df, pd.DataFrame([new_row])], ignore_index=True)
-            save_orders(orders_df)
-            st.success(f"Order {new_id} added.")
-        elif parsed.get("intent") == "delete_order":
-            oid = parsed["order_id"]
-            before = len(orders_df)
-            orders_df = orders_df[orders_df["order_id"] != oid].copy()
-            if len(orders_df) < before:
-                save_orders(orders_df)
-                st.success(f"Order {oid} deleted.")
+@st.cache_data
+def load_data():
+    # Same filenames, but now contain FMCG vrac data
+    orders = pd.read_csv("data/scooter_orders.csv", parse_dates=["due_date"])
+    sched = pd.read_csv(
+        "data/scooter_schedule.csv",
+        parse_dates=["start", "end", "due_date"],
+    )
+    return orders, sched
+
+
+orders, base_schedule = load_data()
+
+# Working schedule in session (so edits persist)
+if "schedule_df" not in st.session_state:
+    st.session_state.schedule_df = base_schedule.copy()
+
+# ============================ FILTER & LOG STATE =======================
+
+if "filters_open" not in st.session_state:
+    st.session_state.filters_open = True
+if "filt_max_orders" not in st.session_state:
+    st.session_state.filt_max_orders = 12
+if "filt_wheels" not in st.session_state:
+    st.session_state.filt_wheels = sorted(
+        base_schedule["wheel_type"].unique().tolist()
+    )
+if "filt_machines" not in st.session_state:
+    st.session_state.filt_machines = sorted(
+        base_schedule["machine"].unique().tolist()
+    )
+if "cmd_log" not in st.session_state:
+    st.session_state.cmd_log = []  # rolling debug log
+
+# ============================ TOP BAR =============================
+
+st.title("FMCG Vrac Scheduler")
+
+toggle_label = "Hide Filters" if st.session_state.filters_open else "Show Filters"
+if st.button(toggle_label, key="toggle_filters_btn"):
+    st.session_state.filters_open = not st.session_state.filters_open
+    st.rerun()
+
+st.markdown("---")
+
+# ============================ SIDEBAR FILTERS =========================
+
+if st.session_state.filters_open:
+    with st.sidebar:
+        st.header("Filters ⚙️")
+
+        st.session_state.filt_max_orders = st.number_input(
+            "Orders",
+            1,
+            100,
+            value=st.session_state.filt_max_orders,
+            step=1,
+            key="num_orders",
+        )
+
+        wheels_all = sorted(base_schedule["wheel_type"].unique().tolist())
+        st.session_state.filt_wheels = st.multiselect(
+            "Product (vrac)",
+            wheels_all,
+            default=st.session_state.filt_wheels or wheels_all,
+            key="wheel_ms",
+        )
+
+        machines_all = sorted(base_schedule["machine"].unique().tolist())
+        st.session_state.filt_machines = st.multiselect(
+            "Machine / Resource",
+            machines_all,
+            default=st.session_state.filt_machines or machines_all,
+            key="machine_ms",
+        )
+
+        if st.button("Reset filters", key="reset_filters"):
+            st.session_state.filt_max_orders = 12
+            st.session_state.filt_wheels = wheels_all
+            st.session_state.filt_machines = machines_all
+            st.rerun()
+
+        # ---- Debug panel in sidebar ----
+        with st.expander(" Debug (last commands)"):
+            if st.session_state.cmd_log:
+                last = st.session_state.cmd_log[-1]
+                st.markdown("**Last payload:**")
+                st.json(last["payload"])
+                st.markdown(
+                    f"- **OK:** {last['ok']}  \n"
+                    f"- **Message:** {last['msg']}  \n"
+                    f"- **Source:** {last.get('source','?')}  \n"
+                    f"- **Raw:** `{last['raw']}`"
+                )
+                mini = [
+                    {
+                        "raw": e["raw"],
+                        "intent": e["payload"].get("intent", "?"),
+                        "ok": e["ok"],
+                        "msg": e["msg"],
+                        "source": e.get("source", "?"),
+                    }
+                    for e in st.session_state.cmd_log[-10:]
+                ]
+                st.dataframe(
+                    pd.DataFrame(mini),
+                    use_container_width=True,
+                    hide_index=True,
+                )
             else:
-                st.warning(f"Order {oid} not found.")
-        elif parsed.get("intent") == "move_order":
-            oid = parsed["order_id"]; due = parsed["due_date"]
-            if oid in set(orders_df["order_id"]):
-                orders_df.loc[orders_df["order_id"]==oid, "due_date"] = due
-                save_orders(orders_df)
-                st.success(f"Order {oid} moved to {due}.")
-            else:
-                st.warning(f"Order {oid} not found.")
+                st.caption("No commands yet.")
+
+# Effective filter values (work even when sidebar hidden)
+max_orders = int(st.session_state.filt_max_orders)
+wheel_choice = st.session_state.filt_wheels or sorted(
+    base_schedule["wheel_type"].unique().tolist()
+)
+machine_choice = st.session_state.filt_machines or sorted(
+    base_schedule["machine"].unique().tolist()
+)
+
+# ============================ NLP / INTELLIGENCE =========================
+
+INTENT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "intent": {
+            "type": "string",
+            "enum": ["delay_order", "move_order", "swap_orders"],
+        },
+        "order_id": {"type": "string", "pattern": "^O\\d{3}$"},
+        "order_id_2": {"type": "string", "pattern": "^O\\d{3}$"},
+        "days": {"type": "number"},
+        "hours": {"type": "number"},
+        "minutes": {"type": "number"},
+        "date": {"type": "string"},
+        "time": {"type": "string"},
+        "timezone": {"type": "string", "default": "Africa/Casablanca"},
+        "note": {"type": "string"},
+    },
+    "required": ["intent"],
+    "additionalProperties": False,
+}
+
+DEFAULT_TZ = "Africa/Casablanca"
+TZ = pytz.timezone(DEFAULT_TZ)
+
+# --- number words -> float (simple MVP up to 20; supports decimals too) ---
+
+NUM_WORDS = {
+    "zero": 0,
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+    "eleven": 11,
+    "twelve": 12,
+    "thirteen": 13,
+    "fourteen": 14,
+    "fifteen": 15,
+    "sixteen": 16,
+    "seventeen": 17,
+    "eighteen": 18,
+    "nineteen": 19,
+    "twenty": 20,
+}
+
+
+def _num_token_to_float(tok: str):
+    t = tok.strip().lower().replace("-", " ")
+    t = t.replace(",", ".")  # 1,5 -> 1.5
+    try:
+        return float(t)
+    except Exception:
+        pass
+    parts = [p for p in t.split() if p]
+    if len(parts) == 1 and parts[0] in NUM_WORDS:
+        return float(NUM_WORDS[parts[0]])
+    if (
+        len(parts) == 2
+        and parts[0] in NUM_WORDS
+        and parts[1] in NUM_WORDS
+    ):
+        return float(NUM_WORDS[parts[0]] + NUM_WORDS[parts[1]])
+    return None
+
+
+def _parse_duration_chunks(text: str):
+    """
+    Parses '1h 30m', '90 minutes', '1.5 hours', '2 days', '45m', '75 min'
+    Returns dict like {'days':2,'hours':1,'minutes':30}
+    """
+    d = {"days": 0.0, "hours": 0.0, "minutes": 0.0}
+    for num, unit in re.findall(
+        r"([\d\.,]+|\b\w+\b)\s*(days?|d|hours?|h|minutes?|mins?|m)\b",
+        text,
+        flags=re.I,
+    ):
+        n = _num_token_to_float(num)
+        if n is None:
+            continue
+        u = unit.lower()
+        if u.startswith("d"):
+            d["days"] += n
+        elif u.startswith("h"):
+            d["hours"] += n
         else:
-            st.info("I could not understand that. Try: add order / delete order / move order")
+            d["minutes"] += n
+    return d
 
-with st.sidebar:
-    st.subheader("Data Inputs")
-    if st.button("Reload CSVs"):
-        load_products.clear(); load_lines.clear(); load_orders.clear()
-        st.experimental_rerun()
-    st.divider()
-    st.subheader("Quick Add")
-    products_df = load_products()
-    sku = st.selectbox("SKU", products_df["sku_id"])
-    qty = st.number_input("Quantity (kg)", value=8000, min_value=1000, step=500)
-    due = st.date_input("Due date", date.today() + timedelta(days=3))
-    if st.button("Add Order"):
-        orders_df = load_orders()
-        new_id = f"ORD-{len(orders_df)+1:03d}"
-        new_row = {"order_id": new_id, "sku_id": sku, "qty_kg": qty, "due_date": str(due)}
-        orders_df = pd.concat([orders_df, pd.DataFrame([new_row])], ignore_index=True)
-        save_orders(orders_df)
-        st.success(f"Order {new_id} added.")
-        st.experimental_rerun()
 
-tabs = st.tabs(["📦 Orders", "🧪 Vrac Products", "🛠️ Lines", "🗓️ Schedule"])
+def _extract_with_openai(user_text: str):
+    from openai import OpenAI
 
-with tabs[0]:
-    st.dataframe(load_orders(), use_container_width=True)
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    SYSTEM = (
+        "You normalize FMCG vrac scheduling edit commands for a Gantt. "
+        "Return ONLY JSON matching the given schema. "
+        "Supported intents: delay_order, move_order, swap_orders. "
+        "Order IDs look like O021 (3 digits). "
+        "If user says 'tomorrow' etc., convert to ISO date in Africa/Casablanca. "
+        "If time missing on move_order, default 08:00. "
+        "If delay units missing, assume days. "
+        "You may return minutes too."
+    )
+    USER_GUIDE = (
+        'Examples:\n'
+        '1) "delay O021 one day" -> {"intent":"delay_order","order_id":"O021","days":1}\n'
+        '2) "push order O009 by 1h 30m" -> {"intent":"delay_order","order_id":"O009","hours":1.0,"minutes":30.0}\n'
+        '3) "move o014 to Nov 6 09:13" -> {"intent":"move_order","order_id":"O014","date":"2025-11-06","time":"09:13"}\n'
+        '4) "swap o027 with o031" -> {"intent":"swap_orders","order_id":"O027","order_id_2":"O031"}\n'
+        '5) "advance O008 by two days" -> {"intent":"delay_order","order_id":"O008","days":-2}\n'
+    )
+    resp = client.responses.create(
+        model="gpt-5.1",
+        input=[
+            {"role": "system", "content": SYSTEM},
+            {"role": "user", "content": USER_GUIDE},
+            {"role": "user", "content": user_text},
+        ],
+        response_format={
+            "type": "json_schema",
+            "json_schema": {"name": "Edit", "schema": INTENT_SCHEMA},
+        },
+    )
+    text = resp.output[0].content[0].text
+    data = json.loads(text)
+    data["_source"] = "openai"
+    return data
 
-with tabs[1]:
-    st.dataframe(load_products(), use_container_width=True)
 
-with tabs[2]:
-    st.dataframe(load_lines(), use_container_width=True)
+def _regex_fallback(user_text: str):
+    t = user_text.strip()
+    low = t.lower()
 
-with tabs[3]:
-    orders_df = load_orders()
-    products_df = load_products()
-    sched_df = build_schedule(products_df, orders_df)
+    # --- SWAP: "swap O023 O053" | "swap O023 with O053" | "swap O023 & O053"
+    m = re.search(
+        r"(?:^|\b)(swap|switch)\s+(o\d{3})\s*(?:with|and|&)?\s*(o\d{3})\b",
+        low,
+    )
+    if m:
+        return {
+            "intent": "swap_orders",
+            "order_id": m.group(2).upper(),
+            "order_id_2": m.group(3).upper(),
+            "_source": "regex",
+        }
 
-    last_ops = sched_df.loc[sched_df["operation"]=="FIN"].copy()
-    orders = load_orders().copy()
-    last_ops = last_ops.merge(orders[["order_id","due_date"]], on="order_id", how="left")
-    last_ops["is_on_time"] = pd.to_datetime(last_ops["end"]) <= pd.to_datetime(last_ops["due_date"])
+    # --- DELAY synonyms: delay/push/postpone (positive),
+    #     advance/bring forward/pull in (negative)
+    delay_sign = +1
+    if re.search(r"\b(advance|bring\s+forward|pull\s+in)\b", low):
+        delay_sign = -1
+        low_norm = re.sub(
+            r"\b(advance|bring\s+forward|pull\s+in)\b", "delay", low
+        )
+    else:
+        low_norm = low
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Orders", len(orders))
-    ontime = (100*last_ops["is_on_time"].mean()) if len(last_ops) else 0.0
-    c2.metric("On-time %", f"{ontime:.0f}%")
-    horizon_days = max(0, (sched_df["end"].max() - datetime.now()).days) if not sched_df.empty else 0
-    c3.metric("Horizon (days)", f"{horizon_days}")
+    # Try patterns with explicit "by "
+    m = re.search(
+        r"(delay|push|postpone)\s+(o\d{3}).*?\bby\b\s+(.+)$", low_norm
+    )
+    if m:
+        oid = m.group(2).upper()
+        dur_text = m.group(3)
+        dur = _parse_duration_chunks(dur_text)
+        if any(v != 0 for v in dur.values()):
+            return {
+                "intent": "delay_order",
+                "order_id": oid,
+                "days": delay_sign * dur["days"],
+                "hours": delay_sign * dur["hours"],
+                "minutes": delay_sign * dur["minutes"],
+                "_source": "regex",
+            }
 
-    st.caption("No-wait enforced: MIX ends → TRANS starts → FILL starts → FIN starts with zero waiting.")
-    gantt(sched_df)
+    # Try patterns without "by", e.g. "delay O076 two days"
+    m = re.search(
+        r"(delay|push|postpone)\s+(o\d{3}).*?(days?|d|hours?|h|minutes?|mins?|m)\b",
+        low_norm,
+    )
+    if m:
+        oid = m.group(2).upper()
+        dur = _parse_duration_chunks(low_norm)
+        if any(v != 0 for v in dur.values()):
+            return {
+                "intent": "delay_order",
+                "order_id": oid,
+                "days": delay_sign * dur["days"],
+                "hours": delay_sign * dur["hours"],
+                "minutes": delay_sign * dur["minutes"],
+                "_source": "regex",
+            }
 
-    csv_bytes = sched_df.to_csv(index=False).encode("utf-8")
-    st.download_button("Download schedule as CSV", data=csv_bytes, file_name="fmcg_schedule.csv", mime="text/csv")
+    # --- MOVE: "move Oxxx to/on "
+    m = re.search(r"(move|set|schedule)\s+(o\d{3})\s+(to|on)\s+(.+)", low)
+    if m:
+        oid = m.group(2).upper()
+        when = m.group(4)
+        try:
+            dt = dtp.parse(when, fuzzy=True)
+            return {
+                "intent": "move_order",
+                "order_id": oid,
+                "date": dt.date().isoformat(),
+                "time": dt.strftime("%H:%M"),
+                "_source": "regex",
+            }
+        except Exception:
+            pass
+
+    # Simple fallback: "one day"
+    m = re.search(
+        r"(delay|push|postpone)\s+(o\d{3}).*\b(one)\s+day\b", low_norm
+    )
+    if m:
+        return {
+            "intent": "delay_order",
+            "order_id": m.group(2).upper(),
+            "days": delay_sign * 1,
+            "_source": "regex",
+        }
+
+    return {"intent": "unknown", "raw": user_text, "_source": "regex"}
+
+
+def extract_intent(user_text: str) -> dict:
+    try:
+        if os.getenv("OPENAI_API_KEY"):
+            return _extract_with_openai(user_text)
+    except Exception:
+        pass
+    return _regex_fallback(user_text)
+
+
+def validate_intent(payload: dict, orders_df, sched_df):
+    intent = payload.get("intent")
+
+    def order_exists(oid):
+        return oid and (orders_df["order_id"] == oid).any()
+
+    if intent not in ("delay_order", "move_order", "swap_orders"):
+        return False, "Unsupported intent"
+
+    if intent in ("delay_order", "move_order", "swap_orders"):
+        oid = payload.get("order_id")
+        if not order_exists(oid):
+            return False, f"Unknown order_id: {oid}"
+
+    if intent == "swap_orders":
+        oid2 = payload.get("order_id_2")
+        if not order_exists(oid2):
+            return False, f"Unknown order_id_2: {oid2}"
+        if oid2 == payload.get("order_id"):
+            return False, "Cannot swap the same order."
+        return True, "ok"
+
+    if intent == "delay_order":
+        # normalize numbers and allow minutes
+        for k in ("days", "hours", "minutes"):
+            if k in payload and payload[k] is not None:
+                try:
+                    payload[k] = float(payload[k])
+                except Exception:
+                    return False, f"{k.capitalize()} must be numeric."
+        if not any(payload.get(k) for k in ("days", "hours", "minutes")):
+            return False, "Delay needs a duration (days/hours/minutes)."
+        return True, "ok"
+
+    if intent == "move_order":
+        date_str = payload.get("date")
+        hhmm = payload.get("time") or "08:00"
+        if not date_str:
+            return False, "Move needs a date."
+        try:
+            dt = dtp.parse(f"{date_str} {hhmm}")
+            if dt.tzinfo is None:
+                dt = TZ.localize(dt)
+            else:
+                dt = dt.astimezone(TZ)
+            payload["_target_dt"] = dt
+        except Exception:
+            return False, f"Unparseable datetime: {date_str} {hhmm}"
+        return True, "ok"
+
+    return False, "Invalid payload"
+
+
+# ============================ APPLY FUNCTIONS =========================
+
+
+def _repack_touched_machines(s: pd.DataFrame, touched_orders):
+    machines = s.loc[s["order_id"].isin(touched_orders), "machine"].unique().tolist()
+    for m in machines:
+        block_idx = s.index[s["machine"] == m]
+        block = s.loc[block_idx].sort_values(["start", "end"]).copy()
+        last_end = None
+        for idx, row in block.iterrows():
+            if last_end is not None and row["start"] < last_end:
+                dur = row["end"] - row["start"]
+                s.at[idx, "start"] = last_end
+                s.at[idx, "end"] = last_end + dur
+            last_end = s.at[idx, "end"]
+    return s
+
+
+def apply_delay(schedule_df: pd.DataFrame, order_id: str, days=0, hours=0, minutes=0):
+    s = schedule_df.copy()
+    delta = timedelta(
+        days=float(days or 0),
+        hours=float(hours or 0),
+        minutes=float(minutes or 0),
+    )
+    mask = s["order_id"] == order_id
+    s.loc[mask, "start"] = s.loc[mask, "start"] + delta
+    s.loc[mask, "end"] = s.loc[mask, "end"] + delta
+    return _repack_touched_machines(s, [order_id])
+
+
+def apply_move(schedule_df: pd.DataFrame, order_id: str, target_dt):
+    s = schedule_df.copy()
+    t0 = s.loc[s["order_id"] == order_id, "start"].min()
+    delta = target_dt - t0
+    days = delta.days
+    hours = delta.seconds // 3600
+    minutes = (delta.seconds % 3600) // 60
+    return apply_delay(s, order_id, days=days, hours=hours, minutes=minutes)
+
+
+def apply_swap(schedule_df: pd.DataFrame, a: str, b: str):
+    s = schedule_df.copy()
+    a0 = s.loc[s["order_id"] == a, "start"].min()
+    b0 = s.loc[s["order_id"] == b, "start"].min()
+    da = b0 - a0
+    db = a0 - b0
+    s = apply_delay(
+        s,
+        a,
+        days=da.days,
+        hours=da.seconds // 3600,
+        minutes=(da.seconds % 3600) // 60,
+    )
+    s = apply_delay(
+        s,
+        b,
+        days=db.days,
+        hours=db.seconds // 3600,
+        minutes=(db.seconds % 3600) // 60,
+    )
+    return s
+
+
+# ============================ FILTER & CHART =========================
+
+sched = st.session_state.schedule_df.copy()
+sched = sched[sched["wheel_type"].isin(wheel_choice)]
+sched = sched[sched["machine"].isin(machine_choice)]
+
+order_priority = (
+    sched.groupby("order_id", as_index=False)["start"]
+    .min()
+    .sort_values("start")
+)
+keep_ids = order_priority["order_id"].head(max_orders).tolist()
+sched = sched[sched["order_id"].isin(keep_ids)].copy()
+
+if sched.empty:
+    st.info("No operations match the current filters.")
+else:
+    color_map = {
+        "VRAC_SHAMPOO_BASE": "#1f77b4",
+        "VRAC_CONDITIONER_BASE": "#ff7f0e",
+        "VRAC_HAIR_MASK": "#2ca02c",
+    }
+    domain = list(color_map.keys())
+    range_ = [color_map[k] for k in domain]
+
+    select_order = alt.selection_point(
+        fields=["order_id"], on="click", clear="dblclick"
+    )
+    y_machines_sorted = sorted(sched["machine"].unique().tolist())
+
+    base_enc = {
+        "y": alt.Y("machine:N", sort=y_machines_sorted, title=None),
+        "x": alt.X(
+            "start:T",
+            title=None,
+            axis=alt.Axis(format="%a %b %d"),
+        ),
+        "x2": "end:T",
+    }
+
+    bars = (
+        alt.Chart(sched)
+        .mark_bar(cornerRadius=3)
+        .encode(
+            color=alt.condition(
+                select_order,
+                alt.Color(
+                    "wheel_type:N",
+                    scale=alt.Scale(domain=domain, range=range_),
+                    legend=None,
+                ),
+                alt.value("#dcdcdc"),
+            ),
+            opacity=alt.condition(
+                select_order, alt.value(1.0), alt.value(0.25)
+            ),
+            tooltip=[
+                alt.Tooltip("order_id:N", title="Order"),
+                alt.Tooltip("operation:N", title="Operation"),
+                alt.Tooltip("sequence:Q", title="Seq"),
+                alt.Tooltip("machine:N", title="Machine"),
+                alt.Tooltip("start:T", title="Start"),
+                alt.Tooltip("end:T", title="End"),
+                alt.Tooltip("due_date:T", title="Due"),
+                alt.Tooltip("wheel_type:N", title="Product"),
+            ],
+        )
+    )
+
+    labels = (
+        alt.Chart(sched)
+        .mark_text(
+            align="left",
+            dx=6,
+            baseline="middle",
+            fontSize=10,
+            color="white",
+        )
+        .encode(
+            text="order_id:N",
+            opacity=alt.condition(
+                select_order, alt.value(1.0), alt.value(0.7)
+            ),
+        )
+    )
+
+    gantt = (
+        alt.layer(bars, labels, data=sched)
+        .encode(**base_enc)
+        .add_params(select_order)
+        .properties(width="container", height=520)
+        .configure_view(stroke=None)
+    )
+
+    st.altair_chart(gantt, use_container_width=True)
+
+# ============================ INTELLIGENCE INPUT =========================
+
+user_cmd = st.chat_input("Type a command (delay/move/swap)…", key="cmd_input")
+
+if user_cmd:
+    try:
+        payload = extract_intent(user_cmd)
+        ok, msg = validate_intent(payload, orders, st.session_state.schedule_df)
+
+        # log it (json-safe)
+        log_payload = dict(payload)
+        if "_target_dt" in log_payload:
+            log_payload["_target_dt"] = str(log_payload["_target_dt"])
+        st.session_state.cmd_log.append(
+            {
+                "raw": user_cmd,
+                "payload": log_payload,
+                "ok": bool(ok),
+                "msg": msg,
+                "source": payload.get("_source", "?"),
+            }
+        )
+        st.session_state.cmd_log = st.session_state.cmd_log[-50:]
+
+        if not ok:
+            st.error(f"❌ Cannot apply: {msg}")
+        else:
+            if payload["intent"] == "delay_order":
+                st.session_state.schedule_df = apply_delay(
+                    st.session_state.schedule_df,
+                    payload["order_id"],
+                    days=payload.get("days", 0),
+                    hours=payload.get("hours", 0),
+                    minutes=payload.get("minutes", 0),
+                )
+                st.success(f"✅ Delayed {payload['order_id']}.")
+            elif payload["intent"] == "move_order":
+                st.session_state.schedule_df = apply_move(
+                    st.session_state.schedule_df,
+                    payload["order_id"],
+                    payload["_target_dt"],
+                )
+                st.success(f"✅ Moved {payload['order_id']}.")
+            elif payload["intent"] == "swap_orders":
+                st.session_state.schedule_df = apply_swap(
+                    st.session_state.schedule_df,
+                    payload["order_id"],
+                    payload["order_id_2"],
+                )
+                st.success(
+                    f"✅ Swapped {payload['order_id']} and {payload['order_id_2']}."
+                )
+        st.rerun()
+    except Exception as e:
+        st.error(f"⚠️ Error: {e}")
