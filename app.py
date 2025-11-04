@@ -27,13 +27,21 @@ except Exception:
 
 @st.cache_data
 def load_and_generate_data():
-    """Load orders and generate a denser schedule"""
+    """Load orders and generate a denser schedule with hard constraints"""
     orders_df = pd.read_csv("data/orders.csv", parse_dates=["due_date"])
-    products_df = pd.read_csv("data/vrac_products.csv")
     lines_df = pd.read_csv("data/lines.csv")
     
-    # Create mapping for rates
-    product_rates = products_df.set_index('sku_id').to_dict('index')
+    # Production rates as percentage of total order time
+    # Based on typical FMCG bulk production flow
+    time_percentages = {
+        'VRAC_SHAMPOO_BASE': {'MIX': 0.100, 'TRF': 0.090, 'FILL': 0.130, 'FIN': 0.080},
+        'VRAC_CONDITIONER_BASE': {'MIX': 0.100, 'TRF': 0.050, 'FILL': 0.100, 'FIN': 0.050},
+        'VRAC_HAIR_MASK': {'MIX': 0.130, 'TRF': 0.110, 'FILL': 0.100, 'FIN': 0.070}
+    }
+    
+    # Create machine name mapping
+    machine_names = {row['line_id']: row['name'] for _, row in lines_df.iterrows()}
+    
     line_map = {
         'MIX': 'MIX_1',
         'TRF': 'TRF_1', 
@@ -56,27 +64,38 @@ def load_and_generate_data():
         qty = order['qty_kg']
         due = order['due_date']
         
-        # Get product rates
-        rates = product_rates.get(sku, {})
-        mix_rate = rates.get('mix_rate_kg_per_h', 5000)
-        trf_rate = rates.get('transfer_rate_kg_per_h', 14000)
-        fill_rate = rates.get('fill_rate_kg_per_h', 4500)
-        fin_rate = rates.get('finish_rate_kg_per_h', 18000)
+        # Get time percentages for this product
+        percentages = time_percentages.get(sku, time_percentages['VRAC_SHAMPOO_BASE'])
         
-        # Calculate durations in hours
+        # Base time calculation (in hours) - scales with quantity
+        base_time = qty / 1000  # 1 hour per 1000kg as baseline
+        
+        # Calculate durations for each operation
         operations = [
-            ('MIX', mix_rate, 1),
-            ('TRF', trf_rate, 2),
-            ('FILL', fill_rate, 3),
-            ('FIN', fin_rate, 4)
+            ('MIX', percentages['MIX'], 1),
+            ('TRF', percentages['TRF'], 2),
+            ('FILL', percentages['FILL'], 3),
+            ('FIN', percentages['FIN'], 4)
         ]
         
-        for op_type, rate, seq in operations:
+        # HARD CONSTRAINT: Each order flows through operations sequentially
+        # Start when machine is free, then cascade through operations
+        order_start_time = None
+        
+        for op_type, time_pct, seq in operations:
             machine = line_map[op_type]
-            duration_hours = qty / rate
+            duration_hours = base_time * time_pct
             
-            # Start right after previous operation on this machine ends
-            op_start = machine_timeline[machine]
+            if order_start_time is None:
+                # First operation: start when machine is free
+                op_start = machine_timeline[machine]
+                order_start_time = op_start
+            else:
+                # Subsequent operations: start immediately after previous op ends
+                # BUT also respect machine availability
+                earliest_start = max(prev_end, machine_timeline[machine])
+                op_start = earliest_start
+            
             op_end = op_start + timedelta(hours=duration_hours)
             
             schedule_rows.append({
@@ -84,14 +103,16 @@ def load_and_generate_data():
                 'operation': op_type,
                 'sequence': seq,
                 'machine': machine,
+                'machine_name': machine_names[machine],
                 'start': op_start,
                 'end': op_end,
                 'due_date': due,
-                'wheel_type': sku  # Using sku as product type
+                'wheel_type': sku
             })
             
-            # Update machine timeline
+            # Update machine timeline and track for cascade
             machine_timeline[machine] = op_end
+            prev_end = op_end
     
     schedule_df = pd.DataFrame(schedule_rows)
     return orders_df, schedule_df
@@ -105,6 +126,8 @@ if "schedule_df" not in st.session_state:
 
 # ============================ FILTER & LOG STATE =======================
 
+if "filters_visible" not in st.session_state:
+    st.session_state.filters_visible = True
 if "filt_max_orders" not in st.session_state:
     st.session_state.filt_max_orders = 20
 if "filt_products" not in st.session_state:
@@ -113,63 +136,100 @@ if "filt_products" not in st.session_state:
     )
 if "filt_machines" not in st.session_state:
     st.session_state.filt_machines = sorted(
-        base_schedule["machine"].unique().tolist()
+        base_schedule["machine_name"].unique().tolist()
     )
 if "cmd_log" not in st.session_state:
     st.session_state.cmd_log = []
 
 # ============================ COMPACT LAYOUT =============================
 
-# Create two columns: filters on left, chart on right
-col_filter, col_chart = st.columns([1, 4])
+# Toggle button for filters (using custom CSS for arrow)
+st.markdown("""
+<style>
+    .filter-toggle {
+        position: fixed;
+        left: 0;
+        top: 50%;
+        transform: translateY(-50%);
+        z-index: 1000;
+        background: #0e1117;
+        border: 1px solid #262730;
+        border-left: none;
+        border-radius: 0 8px 8px 0;
+        padding: 12px 8px;
+        cursor: pointer;
+        transition: all 0.3s;
+    }
+    .filter-toggle:hover {
+        background: #262730;
+    }
+</style>
+""", unsafe_allow_html=True)
 
-with col_filter:
-    st.markdown("### ⚙️ Filters")
-    
-    st.session_state.filt_max_orders = st.number_input(
-        "Orders",
-        1,
-        100,
-        value=st.session_state.filt_max_orders,
-        step=1,
-        key="num_orders",
-    )
-    
-    products_all = sorted(base_schedule["wheel_type"].unique().tolist())
-    st.session_state.filt_products = st.multiselect(
-        "Products",
-        products_all,
-        default=st.session_state.filt_products or products_all,
-        key="product_ms",
-    )
-    
-    machines_all = sorted(base_schedule["machine"].unique().tolist())
-    st.session_state.filt_machines = st.multiselect(
-        "Machines",
-        machines_all,
-        default=st.session_state.filt_machines or machines_all,
-        key="machine_ms",
-    )
-    
-    if st.button("Reset", key="reset_filters"):
-        st.session_state.filt_max_orders = 20
-        st.session_state.filt_products = products_all
-        st.session_state.filt_machines = machines_all
+# Toggle button
+col_toggle, col_main = st.columns([0.05, 0.95])
+with col_toggle:
+    arrow = "◀" if st.session_state.filters_visible else "▶"
+    if st.button(arrow, key="toggle_sidebar", help="Show/Hide Filters"):
+        st.session_state.filters_visible = not st.session_state.filters_visible
         st.rerun()
-    
-    # Debug panel
-    with st.expander("🐛 Debug"):
-        if st.session_state.cmd_log:
-            last = st.session_state.cmd_log[-1]
-            st.caption(f"**Last:** {last['raw']}")
-            st.caption(f"✓ {last['msg']}" if last['ok'] else f"✗ {last['msg']}")
-        else:
-            st.caption("No commands yet")
+
+# Conditional layout based on filter visibility
+if st.session_state.filters_visible:
+    col_filter, col_chart = st.columns([1, 4])
+else:
+    col_filter = None
+    col_chart = st.container()
+
+# Filters section
+if st.session_state.filters_visible and col_filter:
+    with col_filter:
+        st.markdown("### ⚙️ Filters")
+        
+        st.session_state.filt_max_orders = st.number_input(
+            "Orders",
+            1,
+            100,
+            value=st.session_state.filt_max_orders,
+            step=1,
+            key="num_orders",
+        )
+        
+        products_all = sorted(base_schedule["wheel_type"].unique().tolist())
+        st.session_state.filt_products = st.multiselect(
+            "Products",
+            products_all,
+            default=st.session_state.filt_products or products_all,
+            key="product_ms",
+        )
+        
+        machines_all = sorted(base_schedule["machine_name"].unique().tolist())
+        st.session_state.filt_machines = st.multiselect(
+            "Machines",
+            machines_all,
+            default=st.session_state.filt_machines or machines_all,
+            key="machine_ms",
+        )
+        
+        if st.button("Reset", key="reset_filters"):
+            st.session_state.filt_max_orders = 20
+            st.session_state.filt_products = products_all
+            st.session_state.filt_machines = machines_all
+            st.rerun()
+        
+        # Debug panel
+        with st.expander("🐛 Debug"):
+            if st.session_state.cmd_log:
+                last = st.session_state.cmd_log[-1]
+                st.caption(f"**Last:** {last['raw']}")
+                st.caption(f"✓ {last['msg']}" if last['ok'] else f"✗ {last['msg']}")
+            else:
+                st.caption("No commands yet")
 
 # Effective filter values
 max_orders = int(st.session_state.filt_max_orders)
-product_choice = st.session_state.filt_products or products_all
-machine_choice = st.session_state.filt_machines or machines_all
+product_choice = st.session_state.filt_products or sorted(base_schedule["wheel_type"].unique().tolist())
+machine_choice = st.session_state.filt_machines or sorted(base_schedule["machine_name"].unique().tolist())
 
 # ============================ NLP / INTELLIGENCE =========================
 
@@ -324,6 +384,7 @@ def validate_intent(payload: dict, orders_df, sched_df):
 
 
 def _repack_touched_machines(s: pd.DataFrame, touched_orders):
+    """Repack operations maintaining hard constraints (end-to-start)"""
     machines = s.loc[s["order_id"].isin(touched_orders), "machine"].unique().tolist()
     for m in machines:
         block_idx = s.index[s["machine"] == m]
@@ -339,19 +400,27 @@ def _repack_touched_machines(s: pd.DataFrame, touched_orders):
 
 
 def apply_delay(schedule_df: pd.DataFrame, order_id: str, days=0, hours=0, minutes=0):
+    """Apply delay maintaining hard constraints within order operations"""
     s = schedule_df.copy()
     delta = timedelta(
         days=float(days or 0),
         hours=float(hours or 0),
         minutes=float(minutes or 0),
     )
-    mask = s["order_id"] == order_id
-    s.loc[mask, "start"] = s.loc[mask, "start"] + delta
-    s.loc[mask, "end"] = s.loc[mask, "end"] + delta
+    
+    # Get all operations for this order sorted by sequence
+    order_ops = s[s["order_id"] == order_id].sort_values("sequence")
+    
+    for idx, op in order_ops.iterrows():
+        dur = op["end"] - op["start"]
+        s.at[idx, "start"] = op["start"] + delta
+        s.at[idx, "end"] = s.at[idx, "start"] + dur
+    
     return _repack_touched_machines(s, [order_id])
 
 
 def apply_swap(schedule_df: pd.DataFrame, a: str, b: str):
+    """Swap two orders maintaining hard constraints"""
     s = schedule_df.copy()
     a0 = s.loc[s["order_id"] == a, "start"].min()
     b0 = s.loc[s["order_id"] == b, "start"].min()
@@ -377,7 +446,7 @@ def apply_swap(schedule_df: pd.DataFrame, a: str, b: str):
 with col_chart:
     sched = st.session_state.schedule_df.copy()
     sched = sched[sched["wheel_type"].isin(product_choice)]
-    sched = sched[sched["machine"].isin(machine_choice)]
+    sched = sched[sched["machine_name"].isin(machine_choice)]
     
     order_priority = (
         sched.groupby("order_id", as_index=False)["start"]
@@ -398,7 +467,6 @@ with col_chart:
             "#aec7e8", "#ffbb78", "#98df8a", "#ff9896", "#c5b0d5",
             "#c49c94", "#f7b6d2", "#c7c7c7", "#dbdb8d", "#9edae5"
         ]
-        # Extend palette if needed
         while len(color_palette) < len(unique_orders):
             color_palette.extend(color_palette[:10])
         
@@ -407,13 +475,21 @@ with col_chart:
         
         sched["order_color"] = sched["order_id"].map(order_color_map)
         
+        # Define machine order for Y-axis
+        machine_order = [
+            "Mixing/Processing",
+            "Transfer/Holding",
+            "Filling/Capping",
+            "Finishing/QC"
+        ]
+        
         select_order = alt.selection_point(
             fields=["order_id"], on="click", clear="dblclick"
         )
-        y_machines_sorted = sorted(sched["machine"].unique().tolist())
         
         base_enc = {
-            "y": alt.Y("machine:N", sort=y_machines_sorted, title=None),
+            "y": alt.Y("machine_name:N", sort=machine_order, title=None, 
+                      axis=alt.Axis(labelLimit=200)),
             "x": alt.X("start:T", title=None, axis=alt.Axis(format="%b %d %H:%M")),
             "x2": "end:T",
         }
@@ -433,10 +509,10 @@ with col_chart:
                 tooltip=[
                     alt.Tooltip("order_id:N", title="Order"),
                     alt.Tooltip("operation:N", title="Op"),
-                    alt.Tooltip("machine:N", title="Machine"),
-                    alt.Tooltip("start:T", title="Start"),
-                    alt.Tooltip("end:T", title="End"),
-                    alt.Tooltip("due_date:T", title="Due"),
+                    alt.Tooltip("machine_name:N", title="Machine"),
+                    alt.Tooltip("start:T", title="Start", format="%b %d %H:%M"),
+                    alt.Tooltip("end:T", title="End", format="%b %d %H:%M"),
+                    alt.Tooltip("due_date:T", title="Due", format="%b %d"),
                 ],
             )
         )
@@ -456,7 +532,7 @@ with col_chart:
             alt.layer(bars, labels, data=sched)
             .encode(**base_enc)
             .add_params(select_order)
-            .properties(width="container", height=450)
+            .properties(width="container", height=500)
             .configure_view(stroke=None)
         )
         
