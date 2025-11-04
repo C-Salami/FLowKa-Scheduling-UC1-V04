@@ -186,12 +186,12 @@ st.markdown(sidebar_css, unsafe_allow_html=True)
 # Simple top bar with toggle (minimal)
 top_left, top_right = st.columns([0.8, 0.2])
 with top_left:
-    st.markdown("#### Production Scheduler")
-with top_right:
-    toggle_label = "◀ Hide filters" if st.session_state.filters_visible else "▶ Show filters"
-    if st.button(toggle_label, key="toggle_filters_btn"):
-        st.session_state.filters_visible = not st.session_state.filters_visible
-        st.rerun()
+    st.markdown("#### Bulk Production Planner")
+#with top_right:
+#    toggle_label = "◀ Hide filters" if st.session_state.filters_visible else "▶ Show filters"
+#    if st.button(toggle_label, key="toggle_filters_btn"):
+#        st.session_state.filters_visible = not st.session_state.filters_visible
+#        st.rerun()
 
 # ============================ FILTERS IN LEFT SIDEBAR =========================
 
