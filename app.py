@@ -501,33 +501,57 @@ else:
     }
     sched["order_color"] = sched["order_id"].map(order_color_map)
 
-    # Decide which field to color by
+       # Decide which field to color by
+    select_order = alt.selection_point(
+        fields=["order_id"], on="click", clear="dblclick"
+    )
+
     if color_mode == "Order":
-        color_field = "order_color"
-        select_order = alt.selection_point(
-            fields=["order_id"], on="click", clear="dblclick"
-        )
+        # Custom palette per order (already computed in sched['order_color'])
         color_encoding = alt.condition(
             select_order,
-            alt.Color(color_field + ":N", scale=None, legend=None),
+            alt.Color("order_color:N", scale=None, legend=None),
             alt.value("#e0e0e0"),
         )
+
+    elif color_mode == "Product":
+        # Nice fixed 5-color palette for your 5 products
+        product_domain = sorted(sched["wheel_type"].unique().tolist())
+        product_palette = [
+            "#8e44ad",  # purple
+            "#e74c3c",  # red
+            "#3498db",  # blue
+            "#27ae60",  # green
+            "#f39c12",  # orange
+        ]
+        # If you ever have <5 products, we just slice the palette
+        product_palette = product_palette[: len(product_domain)]
+
+        color_encoding = alt.condition(
+            select_order,
+            alt.Color(
+                "wheel_type:N",
+                scale=alt.Scale(domain=product_domain, range=product_palette),
+                legend=None,
+            ),
+            alt.value("#e0e0e0"),
+        )
+
     else:
-        # Map mode -> actual field name
+        # Map mode -> actual field name (Machine / Operation)
         field_map = {
             "Product": "wheel_type",
             "Machine": "machine_name",
             "Operation": "operation",
         }
         actual_field = field_map.get(color_mode, "order_id")
-        select_order = alt.selection_point(
-            fields=["order_id"], on="click", clear="dblclick"
-        )
+
         color_encoding = alt.condition(
             select_order,
             alt.Color(actual_field + ":N", legend=None),
             alt.value("#e0e0e0"),
         )
+
     
     # Define machine order for Y-axis
     machine_order = [
