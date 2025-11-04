@@ -164,6 +164,9 @@ if "filt_machines" not in st.session_state:
     )
 if "cmd_log" not in st.session_state:
     st.session_state.cmd_log = []
+# NEW: color mode state
+if "color_mode" not in st.session_state:
+    st.session_state.color_mode = "Order"
 
 # ============================ COMPACT LAYOUT =============================
 
@@ -235,11 +238,23 @@ if st.session_state.filters_visible and col_filter:
             default=st.session_state.filt_machines or machines_all,
             key="machine_ms",
         )
+
+        # NEW: Color-by selector
+        color_options = ["Order", "Product", "Machine", "Operation"]
+        st.session_state.color_mode = st.selectbox(
+            "Color by",
+            color_options,
+            index=color_options.index(st.session_state.color_mode)
+            if st.session_state.color_mode in color_options
+            else 0,
+            key="color_mode_sb",
+        )
         
         if st.button("Reset", key="reset_filters"):
             st.session_state.filt_max_orders = 20
             st.session_state.filt_products = products_all
             st.session_state.filt_machines = machines_all
+            st.session_state.color_mode = "Order"
             st.rerun()
         
         # Debug panel
@@ -255,6 +270,7 @@ if st.session_state.filters_visible and col_filter:
 max_orders = int(st.session_state.filt_max_orders)
 product_choice = st.session_state.filt_products or sorted(base_schedule["wheel_type"].unique().tolist())
 machine_choice = st.session_state.filt_machines or sorted(base_schedule["machine_name"].unique().tolist())
+color_mode = st.session_state.color_mode
 
 # ============================ NLP / INTELLIGENCE =========================
 
@@ -484,7 +500,7 @@ with col_chart:
     if sched.empty:
         st.info("No operations match filters")
     else:
-        # Generate color per order
+        # Generate color per order (used when color_mode == "Order")
         unique_orders = sorted(sched["order_id"].unique())
         color_palette = [
             "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
@@ -495,10 +511,38 @@ with col_chart:
         while len(color_palette) < len(unique_orders):
             color_palette.extend(color_palette[:10])
         
-        order_color_map = {oid: color_palette[i % len(color_palette)] 
-                          for i, oid in enumerate(unique_orders)}
-        
+        order_color_map = {
+            oid: color_palette[i % len(color_palette)]
+            for i, oid in enumerate(unique_orders)
+        }
         sched["order_color"] = sched["order_id"].map(order_color_map)
+
+        # Decide which field to color by
+        if color_mode == "Order":
+            color_field = "order_color"
+            color_encoding = alt.condition(
+                select_order := alt.selection_point(
+                    fields=["order_id"], on="click", clear="dblclick"
+                ),
+                alt.Color(color_field + ":N", scale=None, legend=None),
+                alt.value("#e0e0e0"),
+            )
+        else:
+            # Map mode -> actual field name
+            field_map = {
+                "Product": "wheel_type",
+                "Machine": "machine_name",
+                "Operation": "operation",
+            }
+            actual_field = field_map.get(color_mode, "order_id")
+            select_order = alt.selection_point(
+                fields=["order_id"], on="click", clear="dblclick"
+            )
+            color_encoding = alt.condition(
+                select_order,
+                alt.Color(actual_field + ":N", legend=None),
+                alt.value("#e0e0e0"),
+            )
         
         # Define machine order for Y-axis
         machine_order = [
@@ -507,10 +551,6 @@ with col_chart:
             "Filling/Capping",
             "Finishing/QC"
         ]
-        
-        select_order = alt.selection_point(
-            fields=["order_id"], on="click", clear="dblclick"
-        )
         
         base_enc = {
             "y": alt.Y("machine_name:N", sort=machine_order, title=None, 
@@ -523,11 +563,7 @@ with col_chart:
             alt.Chart(sched)
             .mark_bar(cornerRadius=2)
             .encode(
-                color=alt.condition(
-                    select_order,
-                    alt.Color("order_color:N", scale=None, legend=None),
-                    alt.value("#e0e0e0"),
-                ),
+                color=color_encoding,
                 opacity=alt.condition(
                     select_order, alt.value(1.0), alt.value(0.3)
                 ),
