@@ -14,6 +14,30 @@ import altair as alt
 
 st.set_page_config(page_title="Production Scheduler", layout="wide")
 
+# Global compact layout: reduce padding & hide default header/footer
+st.markdown("""
+<style>
+/* Shrink main container padding */
+.main .block-container {
+    padding-top: 0.3rem;
+    padding-bottom: 0.3rem;
+    padding-left: 0.6rem;
+    padding-right: 0.6rem;
+    max-width: 100%;
+}
+
+/* Hide the default Streamlit header to gain vertical space */
+header[data-testid="stHeader"] {
+    display: none;
+}
+
+/* Optional: hide footer/menu if you want even more space */
+#MainMenu, footer {
+    visibility: hidden;
+}
+</style>
+""", unsafe_allow_html=True)
+
 # Pull OPENAI key from Streamlit secrets if available
 try:
     os.environ["OPENAI_API_KEY"] = (
@@ -176,7 +200,8 @@ with col_toggle:
 
 # Conditional layout based on filter visibility
 if st.session_state.filters_visible:
-    col_filter, col_chart = st.columns([1, 4])
+    # Slightly narrower filter column, wider chart
+    col_filter, col_chart = st.columns([0.8, 4.2])
 else:
     col_filter = None
     col_chart = st.container()
@@ -532,15 +557,14 @@ with col_chart:
             alt.layer(bars, labels, data=sched)
             .encode(**base_enc)
             .add_params(select_order)
-            .properties(width="container", height=500)
+            .properties(width="container", height=380)
             .configure_view(stroke=None)
         )
         
         st.altair_chart(gantt, use_container_width=True)
 
-# ============================ INTELLIGENCE INPUT =========================
-
-user_cmd = st.chat_input("Delay / Advance / Swap orders…", key="cmd_input")
+    # ============================ INTELLIGENCE INPUT =========================
+    user_cmd = st.chat_input("Delay / Advance / Swap orders…", key="cmd_input")
 
 if user_cmd:
     try:
