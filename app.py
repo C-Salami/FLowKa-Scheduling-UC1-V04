@@ -154,19 +154,20 @@ if "filters_visible" not in st.session_state:
     st.session_state.filters_visible = True
 if "filt_max_orders" not in st.session_state:
     st.session_state.filt_max_orders = 20
+
+# 🟡 Start with no product or machine selected
 if "filt_products" not in st.session_state:
-    st.session_state.filt_products = sorted(
-        base_schedule["wheel_type"].unique().tolist()
-    )
+    st.session_state.filt_products = []
 if "filt_machines" not in st.session_state:
-    st.session_state.filt_machines = sorted(
-        base_schedule["machine_name"].unique().tolist()
-    )
+    st.session_state.filt_machines = []
+
 if "cmd_log" not in st.session_state:
     st.session_state.cmd_log = []
-# NEW: color mode state
+
+# 🟢 Default color mode → Product
 if "color_mode" not in st.session_state:
-    st.session_state.color_mode = "Order"
+    st.session_state.color_mode = "Product"
+
 
 # ============================ SIDEBAR STYLE & TOGGLE =============================
 
