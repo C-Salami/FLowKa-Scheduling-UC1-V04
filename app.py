@@ -188,7 +188,7 @@ top_left, top_right = st.columns([0.8, 0.2])
 with top_left:
     st.markdown("""
         <h4 style="margin-left: 3cm; margin-top: 0.3rem; color: #333;">
-            🧴 Bulk Production Planning
+            🏭 Bulk Production Planning
         </h4>
     """, unsafe_allow_html=True)
 #with top_right:
