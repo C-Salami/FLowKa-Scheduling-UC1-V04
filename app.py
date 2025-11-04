@@ -168,51 +168,36 @@ if "cmd_log" not in st.session_state:
 if "color_mode" not in st.session_state:
     st.session_state.color_mode = "Order"
 
-# ============================ COMPACT LAYOUT =============================
+# ============================ SIDEBAR STYLE & TOGGLE =============================
 
-# Toggle button for filters (using custom CSS for arrow)
-st.markdown("""
+# Control sidebar visibility via CSS, like UC2
+sidebar_display = "block" if st.session_state.filters_visible else "none"
+
+sidebar_css = f"""
 <style>
-    .filter-toggle {
-        position: fixed;
-        left: 0;
-        top: 50%;
-        transform: translateY(-50%);
-        z-index: 1000;
-        background: #0e1117;
-        border: 1px solid #262730;
-        border-left: none;
-        border-radius: 0 8px 8px 0;
-        padding: 12px 8px;
-        cursor: pointer;
-        transition: all 0.3s;
-    }
-    .filter-toggle:hover {
-        background: #262730;
-    }
+/* Use default Streamlit sidebar (grey) but allow hiding via state */
+[data-testid="stSidebar"] {{
+    display: {sidebar_display};
+}}
 </style>
-""", unsafe_allow_html=True)
+"""
+st.markdown(sidebar_css, unsafe_allow_html=True)
 
-# Toggle button
-col_toggle, col_main = st.columns([0.05, 0.95])
-with col_toggle:
-    arrow = "◀" if st.session_state.filters_visible else "▶"
-    if st.button(arrow, key="toggle_sidebar", help="Show/Hide Filters"):
+# Simple top bar with toggle (minimal)
+top_left, top_right = st.columns([0.8, 0.2])
+with top_left:
+    st.markdown("#### Production Scheduler")
+with top_right:
+    toggle_label = "◀ Hide filters" if st.session_state.filters_visible else "▶ Show filters"
+    if st.button(toggle_label, key="toggle_filters_btn"):
         st.session_state.filters_visible = not st.session_state.filters_visible
         st.rerun()
 
-# Conditional layout based on filter visibility
-if st.session_state.filters_visible:
-    # Slightly narrower filter column, wider chart
-    col_filter, col_chart = st.columns([0.8, 4.2])
-else:
-    col_filter = None
-    col_chart = st.container()
+# ============================ FILTERS IN LEFT SIDEBAR =========================
 
-# Filters section
-if st.session_state.filters_visible and col_filter:
-    with col_filter:
-        st.markdown("### ⚙️ Filters")
+if st.session_state.filters_visible:
+    with st.sidebar:
+        st.header("Filters ⚙️")
         
         st.session_state.filt_max_orders = st.number_input(
             "Orders",
@@ -484,123 +469,123 @@ def apply_swap(schedule_df: pd.DataFrame, a: str, b: str):
 
 # ============================ FILTER & CHART =========================
 
-with col_chart:
-    sched = st.session_state.schedule_df.copy()
-    sched = sched[sched["wheel_type"].isin(product_choice)]
-    sched = sched[sched["machine_name"].isin(machine_choice)]
+sched = st.session_state.schedule_df.copy()
+sched = sched[sched["wheel_type"].isin(product_choice)]
+sched = sched[sched["machine_name"].isin(machine_choice)]
+
+order_priority = (
+    sched.groupby("order_id", as_index=False)["start"]
+    .min()
+    .sort_values("start")
+)
+keep_ids = order_priority["order_id"].head(max_orders).tolist()
+sched = sched[sched["order_id"].isin(keep_ids)].copy()
+
+if sched.empty:
+    st.info("No operations match filters")
+else:
+    # Generate color per order (used when color_mode == "Order")
+    unique_orders = sorted(sched["order_id"].unique())
+    color_palette = [
+        "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+        "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
+        "#aec7e8", "#ffbb78", "#98df8a", "#ff9896", "#c5b0d5",
+        "#c49c94", "#f7b6d2", "#c7c7c7", "#dbdb8d", "#9edae5"
+    ]
+    while len(color_palette) < len(unique_orders):
+        color_palette.extend(color_palette[:10])
     
-    order_priority = (
-        sched.groupby("order_id", as_index=False)["start"]
-        .min()
-        .sort_values("start")
-    )
-    keep_ids = order_priority["order_id"].head(max_orders).tolist()
-    sched = sched[sched["order_id"].isin(keep_ids)].copy()
-    
-    if sched.empty:
-        st.info("No operations match filters")
+    order_color_map = {
+        oid: color_palette[i % len(color_palette)]
+        for i, oid in enumerate(unique_orders)
+    }
+    sched["order_color"] = sched["order_id"].map(order_color_map)
+
+    # Decide which field to color by
+    if color_mode == "Order":
+        color_field = "order_color"
+        select_order = alt.selection_point(
+            fields=["order_id"], on="click", clear="dblclick"
+        )
+        color_encoding = alt.condition(
+            select_order,
+            alt.Color(color_field + ":N", scale=None, legend=None),
+            alt.value("#e0e0e0"),
+        )
     else:
-        # Generate color per order (used when color_mode == "Order")
-        unique_orders = sorted(sched["order_id"].unique())
-        color_palette = [
-            "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
-            "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
-            "#aec7e8", "#ffbb78", "#98df8a", "#ff9896", "#c5b0d5",
-            "#c49c94", "#f7b6d2", "#c7c7c7", "#dbdb8d", "#9edae5"
-        ]
-        while len(color_palette) < len(unique_orders):
-            color_palette.extend(color_palette[:10])
-        
-        order_color_map = {
-            oid: color_palette[i % len(color_palette)]
-            for i, oid in enumerate(unique_orders)
+        # Map mode -> actual field name
+        field_map = {
+            "Product": "wheel_type",
+            "Machine": "machine_name",
+            "Operation": "operation",
         }
-        sched["order_color"] = sched["order_id"].map(order_color_map)
+        actual_field = field_map.get(color_mode, "order_id")
+        select_order = alt.selection_point(
+            fields=["order_id"], on="click", clear="dblclick"
+        )
+        color_encoding = alt.condition(
+            select_order,
+            alt.Color(actual_field + ":N", legend=None),
+            alt.value("#e0e0e0"),
+        )
+    
+    # Define machine order for Y-axis
+    machine_order = [
+        "Mixing/Processing",
+        "Transfer/Holding",
+        "Filling/Capping",
+        "Finishing/QC"
+    ]
+    
+    base_enc = {
+        "y": alt.Y("machine_name:N", sort=machine_order, title=None, 
+                  axis=alt.Axis(labelLimit=200)),
+        "x": alt.X("start:T", title=None, axis=alt.Axis(format="%b %d %H:%M")),
+        "x2": "end:T",
+    }
+    
+    bars = (
+        alt.Chart(sched)
+        .mark_bar(cornerRadius=2)
+        .encode(
+            color=color_encoding,
+            opacity=alt.condition(
+                select_order, alt.value(1.0), alt.value(0.3)
+            ),
+            tooltip=[
+                alt.Tooltip("order_id:N", title="Order"),
+                alt.Tooltip("operation:N", title="Op"),
+                alt.Tooltip("machine_name:N", title="Machine"),
+                alt.Tooltip("start:T", title="Start", format="%b %d %H:%M"),
+                alt.Tooltip("end:T", title="End", format="%b %d %H:%M"),
+                alt.Tooltip("due_date:T", title="Due", format="%b %d"),
+            ],
+        )
+    )
+    
+    labels = (
+        alt.Chart(sched)
+        .mark_text(align="left", dx=4, baseline="middle", fontSize=9, color="white")
+        .encode(
+            text="order_id:N",
+            opacity=alt.condition(
+                select_order, alt.value(1.0), alt.value(0.7)
+            ),
+        )
+    )
+    
+    gantt = (
+        alt.layer(bars, labels, data=sched)
+        .encode(**base_enc)
+        .add_params(select_order)
+        .properties(width="container", height=380)
+        .configure_view(stroke=None)
+    )
+    
+    st.altair_chart(gantt, use_container_width=True)
 
-        # Decide which field to color by
-        if color_mode == "Order":
-            color_field = "order_color"
-            color_encoding = alt.condition(
-                select_order := alt.selection_point(
-                    fields=["order_id"], on="click", clear="dblclick"
-                ),
-                alt.Color(color_field + ":N", scale=None, legend=None),
-                alt.value("#e0e0e0"),
-            )
-        else:
-            # Map mode -> actual field name
-            field_map = {
-                "Product": "wheel_type",
-                "Machine": "machine_name",
-                "Operation": "operation",
-            }
-            actual_field = field_map.get(color_mode, "order_id")
-            select_order = alt.selection_point(
-                fields=["order_id"], on="click", clear="dblclick"
-            )
-            color_encoding = alt.condition(
-                select_order,
-                alt.Color(actual_field + ":N", legend=None),
-                alt.value("#e0e0e0"),
-            )
-        
-        # Define machine order for Y-axis
-        machine_order = [
-            "Mixing/Processing",
-            "Transfer/Holding",
-            "Filling/Capping",
-            "Finishing/QC"
-        ]
-        
-        base_enc = {
-            "y": alt.Y("machine_name:N", sort=machine_order, title=None, 
-                      axis=alt.Axis(labelLimit=200)),
-            "x": alt.X("start:T", title=None, axis=alt.Axis(format="%b %d %H:%M")),
-            "x2": "end:T",
-        }
-        
-        bars = (
-            alt.Chart(sched)
-            .mark_bar(cornerRadius=2)
-            .encode(
-                color=color_encoding,
-                opacity=alt.condition(
-                    select_order, alt.value(1.0), alt.value(0.3)
-                ),
-                tooltip=[
-                    alt.Tooltip("order_id:N", title="Order"),
-                    alt.Tooltip("operation:N", title="Op"),
-                    alt.Tooltip("machine_name:N", title="Machine"),
-                    alt.Tooltip("start:T", title="Start", format="%b %d %H:%M"),
-                    alt.Tooltip("end:T", title="End", format="%b %d %H:%M"),
-                    alt.Tooltip("due_date:T", title="Due", format="%b %d"),
-                ],
-            )
-        )
-        
-        labels = (
-            alt.Chart(sched)
-            .mark_text(align="left", dx=4, baseline="middle", fontSize=9, color="white")
-            .encode(
-                text="order_id:N",
-                opacity=alt.condition(
-                    select_order, alt.value(1.0), alt.value(0.7)
-                ),
-            )
-        )
-        
-        gantt = (
-            alt.layer(bars, labels, data=sched)
-            .encode(**base_enc)
-            .add_params(select_order)
-            .properties(width="container", height=380)
-            .configure_view(stroke=None)
-        )
-        
-        st.altair_chart(gantt, use_container_width=True)
-
-    # ============================ INTELLIGENCE INPUT =========================
-    user_cmd = st.chat_input("Delay / Advance / Swap orders…", key="cmd_input")
+# ============================ INTELLIGENCE INPUT =========================
+user_cmd = st.chat_input("Delay / Advance / Swap orders…", key="cmd_input")
 
 if user_cmd:
     try:
